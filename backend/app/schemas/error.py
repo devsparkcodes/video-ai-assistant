@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 
 
@@ -67,7 +67,61 @@ class AnswerResponse(BaseModel):
     created_at: str
 
 
-class YouTubeSessionCreate(BaseModel):
-    """YouTube URL session creation schema."""
+class SessionNotFoundResponse(BaseModel):
+    """Response for session not found."""
     
-    url: str
+    error: ErrorDetail = Field(
+        default=ErrorDetail(
+            code="SESSION_NOT_FOUND",
+            message="Session not found. Please check the session ID.",
+            retryable=False
+        )
+    )
+
+
+class VideoInvalidResponse(BaseModel):
+    """Response for invalid video."""
+    
+    error: ErrorDetail = Field(
+        default=ErrorDetail(
+            code="VIDEO_INVALID",
+            message="This video could not be processed. Please choose another supported video.",
+            retryable=False
+        )
+    )
+
+
+class UnsupportedVideoResponse(BaseModel):
+    """Response for unsupported video format."""
+    
+    error: ErrorDetail = Field(
+        default=ErrorDetail(
+            code="UNSUPPORTED_VIDEO",
+            message="This video format is not supported.",
+            retryable=False
+        )
+    )
+
+
+class VideoTooLargeResponse(BaseModel):
+    """Response for file too large."""
+    
+    error: ErrorDetail = Field(
+        default=ErrorDetail(
+            code="VIDEO_TOO_LARGE",
+            message="File is too large. Please upload a smaller video.",
+            retryable=False
+        )
+    )
+
+
+class InvalidYouTubeUrlResponse(BaseModel):
+    """Response for invalid YouTube URL."""
+    
+    error: ErrorDetail = Field(
+        default=ErrorDetail(
+            code="INVALID_YOUTUBE_URL",
+            message="Invalid YouTube URL. Please provide a valid public YouTube video URL.",
+            retryable=False
+        )
+    )

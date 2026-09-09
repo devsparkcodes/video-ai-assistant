@@ -1,7 +1,16 @@
 import uuid
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Optional
 from sqlmodel import SQLModel, Field, Relationship
+
+
+class SessionStatus(str, Enum):
+    """Session lifecycle status values."""
+    UPLOADING = "UPLOADING"
+    PROCESSING = "PROCESSING"
+    READY = "READY"
+    FAILED = "FAILED"
 
 
 class VideoSession(SQLModel, table=True):
@@ -38,8 +47,8 @@ class VideoSession(SQLModel, table=True):
         default=None,
         description="Gemini File API URI"
     )
-    status: str = Field(
-        default="pending",
+    status: SessionStatus = Field(
+        default=SessionStatus.UPLOADING,
         description="Session lifecycle status"
     )
     active_model: Optional[str] = Field(
