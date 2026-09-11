@@ -7,6 +7,7 @@ from app.services.gemini_service import (
     GeminiErrorCategory,
 )
 from app.services.video_session import VideoSessionService
+from app.services.conversation import ConversationService
 
 __all__ = [
     "GeminiService",
@@ -14,4 +15,5 @@ __all__ = [
     "GeminiError",
     "GeminiErrorCategory",
     "VideoSessionService",
+    "ConversationService",
 ]

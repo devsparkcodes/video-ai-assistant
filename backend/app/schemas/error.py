@@ -54,7 +54,14 @@ class ConversationResponse(BaseModel):
 class QuestionCreate(BaseModel):
     """Question request schema."""
     
-    question: str
+    question: str = Field(min_length=1, max_length=4000)
+
+
+class TimestampRef(BaseModel):
+    """Timestamp reference from Gemini response."""
+    
+    start_seconds: float
+    label: Optional[str] = None
 
 
 class AnswerResponse(BaseModel):
@@ -63,7 +70,7 @@ class AnswerResponse(BaseModel):
     message_id: str
     answer: str
     model: str
-    timestamps: list[dict] = []
+    timestamps: list[TimestampRef] = []
     created_at: str
 
 
