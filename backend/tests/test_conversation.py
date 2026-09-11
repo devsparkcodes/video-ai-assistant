@@ -291,3 +291,256 @@ class TestConversationService:
         
         history = service.get_message_history(ready_session.id)
         assert len(history) == 2
+
+
+class TestConversationServiceAsk:
+    """Test ConversationService.ask() method for Gemini question flow."""
+    
+    def test_ask_first_question_success(self, session, ready_session):
+        """Test first question in a READY session succeeds."""
+        mock_gemini = MagicMock()
+        mock_gemini_answer = GeminiAnswer(
+            text="The video explains HTTP requests.",
+            interaction_id="interaction-abc-123",
+            model="gemini-3.8-flash",
+        )
+        mock_gemini.create_interaction.return_value = mock_gemini_answer
+        
+        service = ConversationService(session, gemini_service=mock_gemini)
+        
+        result = service.ask(
+            session_id=ready_session.id,
+            question="What is this video about?",
+        )
+        
+        assert result.text == "The video explains HTTP requests."
+        assert result.interaction_id == "interaction-abc-123"
+        assert result.model == "gemini-3.8-flash"
+    
+    def test_ask_first_question_calls_gemini_with_video_uri(self, session, ready_session):
+        """Test first question sends video context to Gemini."""
+        mock_gemini = MagicMock()
+        mock_gemini_answer = GeminiAnswer(
+            text="Answer",
+            interaction_id="interaction-123",
+            model="gemini-3.8-flash",
+        )
+        mock_gemini.create_interaction.return_value = mock_gemini_answer
+        
+        ready_session.gemini_file_uri = "gs://test-bucket/test-video.mp4"
+        session.add(ready_session)
+        session.commit()
+        
+        service = ConversationService(session, gemini_service=mock_gemini)
+        
+        service.ask(
+            session_id=ready_session.id,
+            question="What is this video about?",
+        )
+        
+        mock_gemini.create_interaction.assert_called_once()
+        call_kwargs = mock_gemini.create_interaction.call_args[1]
+        assert call_kwargs["video_uri"] == "gs://test-bucket/test-video.mp4"
+        assert call_kwargs["question"] == "What is this video about?"
+        assert call_kwargs["previous_interaction_id"] is None
+    
+    def test_ask_first_question_uses_youtube_url_when_no_file_uri(self, session):
+        """Test first question uses YouTube URL when no gemini_file_uri."""
+        youtube_session = VideoSession(
+            source_type="youtube",
+            source_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            status=SessionStatus.READY,
+        )
+        session.add(youtube_session)
+        session.commit()
+        session.refresh(youtube_session)
+        
+        mock_gemini = MagicMock()
+        mock_gemini_answer = GeminiAnswer(
+            text="Answer",
+            interaction_id="interaction-yt-123",
+            model="gemini-3.8-flash",
+        )
+        mock_gemini.create_interaction.return_value = mock_gemini_answer
+        
+        service = ConversationService(session, gemini_service=mock_gemini)
+        
+        service.ask(
+            session_id=youtube_session.id,
+            question="What is this video about?",
+        )
+        
+        call_kwargs = mock_gemini.create_interaction.call_args[1]
+        assert call_kwargs["video_uri"] == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    
+    def test_ask_first_question_persists_messages(self, session, ready_session):
+        """Test first question persists user and assistant messages."""
+        mock_gemini = MagicMock()
+        mock_gemini_answer = GeminiAnswer(
+            text="The video explains HTTP requests.",
+            interaction_id="interaction-abc-123",
+            model="gemini-3.8-flash",
+        )
+        mock_gemini.create_interaction.return_value = mock_gemini_answer
+        
+        service = ConversationService(session, gemini_service=mock_gemini)
+        
+        service.ask(
+            session_id=ready_session.id,
+            question="What is this video about?",
+        )
+        
+        history = service.get_message_history(ready_session.id)
+        assert len(history) == 2
+        assert history[0].role == "user"
+        assert history[0].content == "What is this video about?"
+        assert history[1].role == "assistant"
+        assert history[1].content == "The video explains HTTP requests."
+        assert history[1].interaction_id == "interaction-abc-123"
+    
+    def test_ask_first_question_updates_session_state(self, session, ready_session):
+        """Test first question updates session's previous_interaction_id and active_model."""
+        mock_gemini = MagicMock()
+        mock_gemini_answer = GeminiAnswer(
+            text="Answer",
+            interaction_id="interaction-new-456",
+            model="gemini-3.8-flash",
+        )
+        mock_gemini.create_interaction.return_value = mock_gemini_answer
+        
+        service = ConversationService(session, gemini_service=mock_gemini)
+        
+        service.ask(
+            session_id=ready_session.id,
+            question="What is this video about?",
+        )
+        
+        updated_session = session.get(VideoSession, ready_session.id)
+        assert updated_session.previous_interaction_id == "interaction-new-456"
+        assert updated_session.active_model == "gemini-3.8-flash"
+    
+    def test_ask_follow_up_uses_previous_interaction_id(self, session, ready_session):
+        """Test follow-up question uses previous_interaction_id."""
+        mock_gemini = MagicMock()
+        mock_gemini_answer = GeminiAnswer(
+            text="Follow-up answer",
+            interaction_id="interaction-followup-789",
+            model="gemini-3.8-flash",
+        )
+        mock_gemini.create_interaction.return_value = mock_gemini_answer
+        
+        ready_session.previous_interaction_id = "interaction-first-123"
+        session.add(ready_session)
+        session.commit()
+        
+        service = ConversationService(session, gemini_service=mock_gemini)
+        
+        service.ask(
+            session_id=ready_session.id,
+            question="What happens after that?",
+        )
+        
+        call_kwargs = mock_gemini.create_interaction.call_args[1]
+        assert call_kwargs["previous_interaction_id"] == "interaction-first-123"
+    
+    def test_ask_follow_up_updates_interaction_id(self, session, ready_session):
+        """Test follow-up question updates session's previous_interaction_id."""
+        mock_gemini = MagicMock()
+        mock_gemini_answer = GeminiAnswer(
+            text="Follow-up answer",
+            interaction_id="interaction-followup-789",
+            model="gemini-3.8-flash",
+        )
+        mock_gemini.create_interaction.return_value = mock_gemini_answer
+        
+        ready_session.previous_interaction_id = "interaction-first-123"
+        session.add(ready_session)
+        session.commit()
+        
+        service = ConversationService(session, gemini_service=mock_gemini)
+        
+        service.ask(
+            session_id=ready_session.id,
+            question="What happens after that?",
+        )
+        
+        updated_session = session.get(VideoSession, ready_session.id)
+        assert updated_session.previous_interaction_id == "interaction-followup-789"
+    
+    def test_ask_non_ready_session_raises_error(self, session):
+        """Test ask() raises error for non-READY session."""
+        uploading_session = VideoSession(
+            source_type="youtube",
+            source_url="https://www.youtube.com/watch?v=test",
+            status=SessionStatus.UPLOADING,
+        )
+        session.add(uploading_session)
+        session.commit()
+        session.refresh(uploading_session)
+        
+        mock_gemini = MagicMock()
+        service = ConversationService(session, gemini_service=mock_gemini)
+        
+        with pytest.raises(ValueError, match="not ready"):
+            service.ask(
+                session_id=uploading_session.id,
+                question="What is this video about?",
+            )
+        
+        mock_gemini.create_interaction.assert_not_called()
+    
+    def test_ask_session_not_found_raises_error(self, session):
+        """Test ask() raises error for non-existent session."""
+        mock_gemini = MagicMock()
+        service = ConversationService(session, gemini_service=mock_gemini)
+        
+        with pytest.raises(ValueError, match="not found"):
+            service.ask(
+                session_id="non-existent-id",
+                question="What is this video about?",
+            )
+        
+        mock_gemini.create_interaction.assert_not_called()
+    
+    def test_ask_gemini_error_propagates(self, session, ready_session):
+        """Test Gemini error is propagated correctly."""
+        from app.services.gemini_service import GeminiError, GeminiErrorCategory
+        
+        mock_gemini = MagicMock()
+        mock_gemini.create_interaction.side_effect = GeminiError(
+            category=GeminiErrorCategory.RATE_LIMITED,
+            message="Rate limit exceeded",
+            retryable=True,
+        )
+        
+        service = ConversationService(session, gemini_service=mock_gemini)
+        
+        with pytest.raises(GeminiError) as exc_info:
+            service.ask(
+                session_id=ready_session.id,
+                question="What is this video about?",
+            )
+        
+        assert exc_info.value.category == GeminiErrorCategory.RATE_LIMITED
+    
+    def test_ask_gemini_error_no_assistant_message_persisted(self, session, ready_session):
+        """Test Gemini error does not persist assistant message."""
+        from app.services.gemini_service import GeminiError, GeminiErrorCategory
+        
+        mock_gemini = MagicMock()
+        mock_gemini.create_interaction.side_effect = GeminiError(
+            category=GeminiErrorCategory.CONTENT_BLOCKED,
+            message="Content blocked",
+            retryable=False,
+        )
+        
+        service = ConversationService(session, gemini_service=mock_gemini)
+        
+        with pytest.raises(GeminiError):
+            service.ask(
+                session_id=ready_session.id,
+                question="What is this video about?",
+            )
+        
+        history = service.get_message_history(ready_session.id)
+        assert len(history) == 0

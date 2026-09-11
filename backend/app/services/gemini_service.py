@@ -42,12 +42,15 @@ class GeminiAnswer:
 
 
 @dataclass
-class GeminiError:
+class GeminiError(Exception):
     """Normalized Gemini error structure."""
     category: GeminiErrorCategory
     message: str
     retryable: bool
     raw_error: Optional[Exception] = None
+    
+    def __str__(self) -> str:
+        return f"[{self.category.value}] {self.message}"
 
 
 class GeminiService:

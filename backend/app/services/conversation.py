@@ -8,7 +8,7 @@ from sqlmodel import Session, select
 
 from app.models.message import Message
 from app.models.video_session import VideoSession, SessionStatus
-from app.services.gemini_service import GeminiAnswer
+from app.services.gemini_service import GeminiAnswer, GeminiService, GeminiError
 
 logger = logging.getLogger(__name__)
 
@@ -16,13 +16,15 @@ logger = logging.getLogger(__name__)
 class ConversationService:
     """Service for managing conversation messages and history."""
     
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, gemini_service: Optional[GeminiService] = None):
         """Initialize the conversation service.
         
         Args:
             db: Database session
+            gemini_service: Gemini service instance (optional, for ask() method)
         """
         self.db = db
+        self.gemini_service = gemini_service
     
     def get_session(self, session_id: str) -> Optional[VideoSession]:
         """Get session by ID.
@@ -190,3 +192,52 @@ class ConversationService:
         
         logger.info(f"Gemini response saved for session: {session_id}")
         return user_message, assistant_message
+    
+    def ask(
+        self,
+        session_id: str,
+        question: str,
+    ) -> GeminiAnswer:
+        """Ask a question about a video session.
+        
+        For the first question, sends the video context to Gemini.
+        For follow-ups, uses the previous_interaction_id for conversation continuity.
+        
+        Args:
+            session_id: Session ID
+            question: User's question
+            
+        Returns:
+            GeminiAnswer with the response
+            
+        Raises:
+            ValueError: If session not found or not ready
+            GeminiError: If Gemini call fails
+        """
+        # Validate session exists and is ready
+        session = self.get_session(session_id)
+        if not session:
+            raise ValueError(f"Session not found: {session_id}")
+        
+        if not self.validate_session_ready(session):
+            raise ValueError(f"Session is not ready for questions: {session.status}")
+        
+        # Determine video context
+        video_uri = session.gemini_file_uri or session.source_url
+        
+        # Call Gemini
+        gemini_answer = self.gemini_service.create_interaction(
+            question=question,
+            video_uri=video_uri,
+            previous_interaction_id=session.previous_interaction_id,
+        )
+        
+        # Persist the conversation
+        self.save_gemini_response(
+            session_id=session_id,
+            user_content=question,
+            gemini_answer=gemini_answer,
+        )
+        
+        logger.info(f"Question answered for session: {session_id}")
+        return gemini_answer
