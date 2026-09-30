@@ -216,7 +216,11 @@ class TestConversationService:
         assert updated.previous_interaction_id == "interaction-new-456"
     
     def test_update_session_conversation_state_without_interaction_id(self, session, ready_session):
-        """Test session state update without interaction ID."""
+        """Test state update without an interaction ID clears the stale ID.
+
+        Phase 5 approved decision: a successful response without an interaction
+        ID must not retain an interaction ID from a previous model.
+        """
         service = ConversationService(session)
         ready_session.previous_interaction_id = "old-id"
         
@@ -227,7 +231,7 @@ class TestConversationService:
         )
         
         assert updated.active_model == "gemini-3.7-flash"
-        assert updated.previous_interaction_id == "old-id"
+        assert updated.previous_interaction_id is None
     
     def test_validate_session_ready(self, session, ready_session):
         """Test session validation for READY status."""
@@ -429,6 +433,7 @@ class TestConversationServiceAsk:
         )
         mock_gemini.create_interaction.return_value = mock_gemini_answer
         
+        ready_session.active_model = "gemini-3.8-flash"
         ready_session.previous_interaction_id = "interaction-first-123"
         session.add(ready_session)
         session.commit()
@@ -453,6 +458,7 @@ class TestConversationServiceAsk:
         )
         mock_gemini.create_interaction.return_value = mock_gemini_answer
         
+        ready_session.active_model = "gemini-3.8-flash"
         ready_session.previous_interaction_id = "interaction-first-123"
         session.add(ready_session)
         session.commit()

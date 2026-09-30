@@ -6,9 +6,11 @@ from datetime import datetime, timezone
 
 from sqlmodel import Session, select
 
+from app.core.config import settings
 from app.models.message import Message
 from app.models.video_session import VideoSession, SessionStatus
 from app.services.gemini_service import GeminiAnswer, GeminiService, GeminiError
+from app.services.model_router import ModelRouter
 
 logger = logging.getLogger(__name__)
 
@@ -16,15 +18,28 @@ logger = logging.getLogger(__name__)
 class ConversationService:
     """Service for managing conversation messages and history."""
     
-    def __init__(self, db: Session, gemini_service: Optional[GeminiService] = None):
+    def __init__(
+        self,
+        db: Session,
+        gemini_service: Optional[GeminiService] = None,
+        router: Optional[ModelRouter] = None,
+    ):
         """Initialize the conversation service.
         
         Args:
             db: Database session
             gemini_service: Gemini service instance (optional, for ask() method)
+            router: Model router instance. When omitted, a default router is
+                built around the provided gemini_service.
         """
         self.db = db
         self.gemini_service = gemini_service
+        if router is not None:
+            self.router = router
+        elif gemini_service is not None:
+            self.router = ModelRouter(gemini_service=gemini_service)
+        else:
+            self.router = None
     
     def get_session(self, session_id: str) -> Optional[VideoSession]:
         """Get session by ID.
@@ -118,14 +133,15 @@ class ConversationService:
         Args:
             session: VideoSession to update
             model: Model used for response
-            interaction_id: Gemini interaction ID (optional)
+            interaction_id: Gemini interaction ID (optional). When missing, any
+                previously stored interaction ID is explicitly cleared so an ID
+                from another model is never retained.
             
         Returns:
             Updated VideoSession
         """
         session.active_model = model
-        if interaction_id:
-            session.previous_interaction_id = interaction_id
+        session.previous_interaction_id = interaction_id or None
         session.updated_at = datetime.now(timezone.utc)
         
         self.db.add(session)
@@ -193,6 +209,39 @@ class ConversationService:
         logger.info(f"Gemini response saved for session: {session_id}")
         return user_message, assistant_message
     
+    def _build_conversation_context(self, session_id: str) -> str:
+        """Reconstruct a bounded conversation context from persisted messages.
+
+        Used when a fresh interaction is required (model switch), per
+        docs/06-conversation-system.md §6. The context is truncated to the
+        most recent CONVERSATION_CONTEXT_MAX_MESSAGES messages; the current
+        question is not persisted yet and therefore never duplicated.
+
+        Args:
+            session_id: Session ID
+
+        Returns:
+            Bounded transcript ("User: ..." / "Assistant: ..." lines), or an
+            empty string when there is no history.
+        """
+        history = self.get_message_history(session_id)
+        if not history:
+            return ""
+
+        max_messages = settings.CONVERSATION_CONTEXT_MAX_MESSAGES
+        try:
+            max_messages = int(max_messages)
+        except (TypeError, ValueError):
+            max_messages = 20
+        if max_messages > 0:
+            history = history[-max_messages:]
+
+        lines = [
+            f"{'User' if message.role == 'user' else 'Assistant'}: {message.content}"
+            for message in history
+        ]
+        return "\n".join(lines)
+
     def ask(
         self,
         session_id: str,
@@ -200,8 +249,13 @@ class ConversationService:
     ) -> GeminiAnswer:
         """Ask a question about a video session.
         
-        For the first question, sends the video context to Gemini.
-        For follow-ups, uses the previous_interaction_id for conversation continuity.
+        Model selection and bounded fallback are delegated to the model
+        router. For same-model follow-ups the router reuses the session's
+        previous_interaction_id; after a model switch it starts a fresh
+        interaction with the video input and reconstructed context.
+
+        On failure nothing is persisted: no failed user question, no fake
+        assistant answer, and no conversation-state mutation.
         
         Args:
             session_id: Session ID
@@ -212,7 +266,8 @@ class ConversationService:
             
         Raises:
             ValueError: If session not found or not ready
-            GeminiError: If Gemini call fails
+            GeminiError: If all eligible attempts fail or a non-retryable
+                error occurs
         """
         # Validate session exists and is ready
         session = self.get_session(session_id)
@@ -221,23 +276,31 @@ class ConversationService:
         
         if not self.validate_session_ready(session):
             raise ValueError(f"Session is not ready for questions: {session.status}")
+
+        if self.router is None:
+            raise RuntimeError(
+                "Conversation service is not configured with a Gemini service."
+            )
         
-        # Determine video context
-        video_uri = session.gemini_file_uri or session.source_url
-        
-        # Call Gemini
-        gemini_answer = self.gemini_service.create_interaction(
+        # Bounded context from persisted messages (used only on model switch)
+        conversation_context = self._build_conversation_context(session_id)
+
+        # The router selects the model, applies bounded fallback, and decides
+        # whether previous_interaction_id may be reused for the chosen model.
+        gemini_answer = self.router.answer(
+            session=session,
             question=question,
-            video_uri=video_uri,
-            previous_interaction_id=session.previous_interaction_id,
+            conversation_context=conversation_context,
         )
         
-        # Persist the conversation
+        # Persist the conversation only after a successful answer
         self.save_gemini_response(
             session_id=session_id,
             user_content=question,
             gemini_answer=gemini_answer,
         )
         
-        logger.info(f"Question answered for session: {session_id}")
+        logger.info(
+            f"Question answered for session: {session_id} by model: {gemini_answer.model}"
+        )
         return gemini_answer

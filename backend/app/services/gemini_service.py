@@ -9,8 +9,9 @@ from dataclasses import dataclass
 from enum import Enum
 import logging
 
+import httpx
 from google import genai
-from google.genai import types
+from google.genai import types, errors as genai_errors
 
 from app.core.config import settings
 
@@ -29,7 +30,9 @@ class GeminiErrorCategory(Enum):
     CONTENT_BLOCKED = "content_blocked"
     TIMEOUT = "timeout"
     NETWORK_ERROR = "network_error"
+    SERVER_ERROR = "server_error"
     UNKNOWN = "unknown"
+    SERVICE_UNAVAILABLE = "service_unavailable"
 
 
 @dataclass
@@ -72,8 +75,26 @@ class GeminiService:
                 "or provide api_key parameter."
             )
         
-        self._client = genai.Client(api_key=self._api_key)
+        # Verified against installed google-genai (2.23.0): genai.Client accepts
+        # http_options=types.HttpOptions(timeout=<milliseconds>).
+        self._client = genai.Client(
+            api_key=self._api_key,
+            http_options=types.HttpOptions(timeout=self._timeout_milliseconds()),
+        )
         self._default_model = settings.gemini_models_list[0] if settings.gemini_models_list else "gemini-3.8-flash"
+
+    @staticmethod
+    def _timeout_milliseconds() -> int:
+        """Resolve the configured upstream timeout in milliseconds.
+
+        GEMINI_TIMEOUT_SECONDS is verified SDK-supported configuration
+        (HttpOptions.timeout is documented in milliseconds).
+        """
+        try:
+            seconds = int(settings.GEMINI_TIMEOUT_SECONDS)
+        except (TypeError, ValueError):
+            seconds = 120
+        return max(1, seconds) * 1000
     
     def create_interaction(
         self,
@@ -111,11 +132,16 @@ class GeminiService:
                 agentic=agentic,
             )
             
-            # Create interaction
+            # Create interaction.
+            # store=True is verified as a supported parameter of the installed
+            # SDK (CreateModelInteractionParam.store) and is required because the
+            # application relies on previous_interaction_id for same-model
+            # continuation (docs/06-conversation-system.md, docs/11-security.md).
             interaction = self._client.interactions.create(
                 model=model_id,
                 input=input_content,
                 previous_interaction_id=previous_interaction_id,
+                store=True,
             )
             
             # Normalize response
@@ -208,8 +234,165 @@ class GeminiService:
             raw_metadata=raw_metadata,
         )
     
+    # Ordered machine-readable status tokens → (category, retryable).
+    # Checked before HTTP codes so that a structured status always wins
+    # (docs/03-gemini-integration.md §9: classify from error codes, not text).
+    _STATUS_RULES: List[Any] = [
+        ("model_not_found", GeminiErrorCategory.MODEL_NOT_FOUND, True),
+        ("content_blocked", GeminiErrorCategory.CONTENT_BLOCKED, False),
+        ("unauthenticated", GeminiErrorCategory.AUTHENTICATION, False),
+        ("authentication", GeminiErrorCategory.AUTHENTICATION, False),
+        ("permission_denied", GeminiErrorCategory.PERMISSION_DENIED, False),
+        ("resource_exhausted", GeminiErrorCategory.RATE_LIMITED, True),
+        ("rate_limit_exceeded", GeminiErrorCategory.RATE_LIMITED, True),
+        ("invalid_argument", GeminiErrorCategory.INVALID_REQUEST, False),
+        ("parameter_unknown", GeminiErrorCategory.INVALID_REQUEST, False),
+        ("failed_precondition", GeminiErrorCategory.INVALID_REQUEST, False),
+        ("invalid_request", GeminiErrorCategory.INVALID_REQUEST, False),
+        ("not_found", GeminiErrorCategory.NOT_FOUND, False),
+        ("deadline_exceeded", GeminiErrorCategory.TIMEOUT, True),
+        ("timeout", GeminiErrorCategory.TIMEOUT, True),
+        ("unavailable", GeminiErrorCategory.SERVER_ERROR, True),
+        ("internal", GeminiErrorCategory.SERVER_ERROR, True),
+        ("network", GeminiErrorCategory.NETWORK_ERROR, True),
+    ]
+
+    @classmethod
+    def _structured_tokens(cls, error: Any) -> List[str]:
+        """Extract machine-readable status tokens from an SDK APIError.
+
+        Only structured fields are inspected (status/reason codes), never
+        free-form message text, per docs/03 and docs/04 §4.
+        """
+        tokens: List[str] = []
+
+        def _add(value: Any) -> None:
+            if isinstance(value, str) and value.strip():
+                tokens.append(value.strip().lower())
+
+        _add(getattr(error, "status", None))
+
+        details = getattr(error, "details", None)
+        if isinstance(details, dict):
+            for key in ("status", "reason", "type"):
+                _add(details.get(key))
+            nested = details.get("error")
+            if isinstance(nested, dict):
+                for key in ("status", "reason"):
+                    _add(nested.get(key))
+        elif isinstance(details, list):
+            for item in details:
+                if isinstance(item, dict):
+                    for key in ("status", "reason"):
+                        _add(item.get(key))
+        return tokens
+
+    @classmethod
+    def _classify_api_error(cls, error: Exception) -> GeminiError:
+        """Classify an SDK APIError from its structured status/code fields."""
+        code = getattr(error, "code", None)
+        tokens = cls._structured_tokens(error)
+
+        # 1) Structured status tokens (most specific first; "model_not_found"
+        #    must be matched before the generic "not_found" rule).
+        for token in tokens:
+            for match, category, retryable in cls._STATUS_RULES:
+                if token == match:
+                    return GeminiError(
+                        category=category,
+                        message=cls._message_for(category),
+                        retryable=retryable,
+                        raw_error=error,
+                    )
+
+        # 2) HTTP status codes when no structured token matched.
+        if isinstance(error, genai_errors.ServerError) or (
+            isinstance(code, int) and 500 <= code < 600
+        ):
+            category = GeminiErrorCategory.SERVER_ERROR
+            retryable = True
+        elif code == 401:
+            category = GeminiErrorCategory.AUTHENTICATION
+            retryable = False
+        elif code == 403:
+            category = GeminiErrorCategory.PERMISSION_DENIED
+            retryable = False
+        elif code == 429:
+            category = GeminiErrorCategory.RATE_LIMITED
+            retryable = True
+        elif code == 408:
+            category = GeminiErrorCategory.TIMEOUT
+            retryable = True
+        elif code == 400:
+            category = GeminiErrorCategory.INVALID_REQUEST
+            retryable = False
+        elif code == 404:
+            # A 404 without a model_not_found status is a resource error:
+            # never rotate models for it (Phase 5 decision 2).
+            category = GeminiErrorCategory.NOT_FOUND
+            retryable = False
+        else:
+            category = GeminiErrorCategory.UNKNOWN
+            retryable = True
+
+        return GeminiError(
+            category=category,
+            message=cls._message_for(category),
+            retryable=retryable,
+            raw_error=error,
+        )
+
+    @staticmethod
+    def _message_for(category: GeminiErrorCategory) -> str:
+        """User-safe message for a normalized category."""
+        return {
+            GeminiErrorCategory.AUTHENTICATION: (
+                "Authentication failed. Please check your API key configuration."
+            ),
+            GeminiErrorCategory.PERMISSION_DENIED: (
+                "Permission denied. Your API key does not have access to this resource."
+            ),
+            GeminiErrorCategory.INVALID_REQUEST: (
+                "Invalid request. Please check your input."
+            ),
+            GeminiErrorCategory.MODEL_NOT_FOUND: (
+                "Model not found. The requested model is not available."
+            ),
+            GeminiErrorCategory.NOT_FOUND: (
+                "The requested resource was not found. The video session may have expired."
+            ),
+            GeminiErrorCategory.RATE_LIMITED: (
+                "Rate limit exceeded. Please try again later."
+            ),
+            GeminiErrorCategory.CONTENT_BLOCKED: (
+                "Content was blocked by safety filters."
+            ),
+            GeminiErrorCategory.TIMEOUT: "Request timed out. Please try again.",
+            GeminiErrorCategory.NETWORK_ERROR: (
+                "Network error. Please check your connection."
+            ),
+            GeminiErrorCategory.SERVER_ERROR: (
+                "The video service is temporarily unavailable. Please try again."
+            ),
+            GeminiErrorCategory.SERVICE_UNAVAILABLE: (
+                "All supported models are temporarily unavailable. Please try again later."
+            ),
+            GeminiErrorCategory.UNKNOWN: (
+                "An unexpected error occurred. Please try again."
+            ),
+        }.get(category, "An unexpected error occurred. Please try again.")
+
     def _normalize_error(self, error: Exception) -> GeminiError:
-        """Normalize Gemini error to internal error structure.
+        """Normalize a Gemini error to the internal error structure.
+        
+        Classification order:
+        1. Already-normalized GeminiError is returned unchanged.
+        2. SDK APIError subclasses are classified from machine-readable
+           status/code fields (docs/03 §9, docs/04 §4).
+        3. Transport exceptions (timeouts, connection failures) are classified
+           from their exception type.
+        4. A conservative text fallback handles non-SDK exceptions that do not
+           carry structured fields.
         
         Args:
             error: Raw Gemini error.
@@ -217,6 +400,30 @@ class GeminiService:
         Returns:
             Normalized Gemini error.
         """
+        if isinstance(error, GeminiError):
+            return error
+
+        # Structured SDK errors (google-genai errors.APIError and subclasses).
+        if isinstance(error, genai_errors.APIError):
+            return self._classify_api_error(error)
+
+        # Transport-level errors from the underlying HTTP client.
+        if isinstance(error, (httpx.TimeoutException, TimeoutError)):
+            return GeminiError(
+                category=GeminiErrorCategory.TIMEOUT,
+                message=self._message_for(GeminiErrorCategory.TIMEOUT),
+                retryable=True,
+                raw_error=error,
+            )
+        if isinstance(error, (httpx.TransportError, ConnectionError)):
+            return GeminiError(
+                category=GeminiErrorCategory.NETWORK_ERROR,
+                message=self._message_for(GeminiErrorCategory.NETWORK_ERROR),
+                retryable=True,
+                raw_error=error,
+            )
+
+        # Text fallback for plain exceptions without structured fields.
         error_str = str(error).lower()
         
         # Classify error based on exception type and message
@@ -234,11 +441,11 @@ class GeminiService:
                 retryable=False,
                 raw_error=error,
             )
-        elif "model_not_found" in error_str or "404" in error_str:
+        elif "model_not_found" in error_str:
             return GeminiError(
                 category=GeminiErrorCategory.MODEL_NOT_FOUND,
                 message="Model not found. The requested model is not available.",
-                retryable=False,
+                retryable=True,
                 raw_error=error,
             )
         elif "rate_limit" in error_str or "429" in error_str or "resource_exhausted" in error_str:
@@ -248,7 +455,7 @@ class GeminiService:
                 retryable=True,
                 raw_error=error,
             )
-        elif "content_blocked" in error_str or "safety" in error_str:
+        elif "content_blocked" in error_str or "content blocked" in error_str or "safety" in error_str:
             return GeminiError(
                 category=GeminiErrorCategory.CONTENT_BLOCKED,
                 message="Content was blocked by safety filters.",
@@ -262,7 +469,12 @@ class GeminiService:
                 retryable=True,
                 raw_error=error,
             )
-        elif "invalid_request" in error_str or "bad_request" in error_str or "400" in error_str:
+        elif (
+            "invalid_request" in error_str
+            or "invalid request" in error_str
+            or "bad_request" in error_str
+            or "400" in error_str
+        ):
             return GeminiError(
                 category=GeminiErrorCategory.INVALID_REQUEST,
                 message="Invalid request. Please check your input.",
@@ -276,11 +488,19 @@ class GeminiService:
                 retryable=True,
                 raw_error=error,
             )
+        elif "404" in error_str:
+            # A bare 404 in text is a resource error, not model unavailability.
+            return GeminiError(
+                category=GeminiErrorCategory.NOT_FOUND,
+                message="The requested resource was not found. The video session may have expired.",
+                retryable=False,
+                raw_error=error,
+            )
         else:
             return GeminiError(
                 category=GeminiErrorCategory.UNKNOWN,
                 message="An unexpected error occurred. Please try again.",
-                retryable=False,
+                retryable=True,
                 raw_error=error,
             )
     

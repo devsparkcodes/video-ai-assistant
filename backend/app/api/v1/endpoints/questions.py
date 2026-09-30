@@ -38,6 +38,7 @@ def get_conversation_service(
         422: {"model": ErrorResponse},
         429: {"model": ErrorResponse},
         502: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
     },
 )
 async def ask_question(
@@ -109,6 +110,17 @@ async def ask_question(
                     }
                 },
             )
+        elif e.category == GeminiErrorCategory.PERMISSION_DENIED:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": {
+                        "code": "GEMINI_AUTH_ERROR",
+                        "message": "The video service is not configured correctly. Please contact the administrator.",
+                        "retryable": False,
+                    }
+                },
+            )
         elif e.category == GeminiErrorCategory.RATE_LIMITED:
             raise HTTPException(
                 status_code=429,
@@ -128,6 +140,43 @@ async def ask_question(
                         "code": "GEMINI_SAFETY_REJECTED",
                         "message": "The request cannot be processed due to content restrictions.",
                         "retryable": False,
+                    }
+                },
+            )
+        elif e.category == GeminiErrorCategory.INVALID_REQUEST:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": {
+                        "code": "GEMINI_INVALID_REQUEST",
+                        "message": "The request could not be processed. Please check your input and try again.",
+                        "retryable": False,
+                    }
+                },
+            )
+        elif e.category == GeminiErrorCategory.NOT_FOUND:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": {
+                        "code": "VIDEO_EXPIRED",
+                        "message": "This video's session has expired. Please upload the video again.",
+                        "retryable": False,
+                    }
+                },
+            )
+        elif e.category in (
+            GeminiErrorCategory.SERVICE_UNAVAILABLE,
+            GeminiErrorCategory.MODEL_NOT_FOUND,
+        ):
+            # All eligible models are unavailable (docs/07-api-design.md §5).
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": {
+                        "code": "GEMINI_UNAVAILABLE",
+                        "message": "Video analysis is temporarily unavailable. Please try again later.",
+                        "retryable": True,
                     }
                 },
             )

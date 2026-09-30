@@ -142,6 +142,7 @@ class TestQuestionEndpointSuccess:
         )
         mock_gemini.create_interaction.return_value = mock_gemini_answer
 
+        ready_session.active_model = "gemini-3.8-flash"
         ready_session.previous_interaction_id = "interaction-first-123"
         session.add(ready_session)
         session.commit()
@@ -294,8 +295,12 @@ class TestQuestionEndpointGeminiErrors:
         assert data["detail"]["error"]["code"] == "GEMINI_SAFETY_REJECTED"
         assert data["detail"]["error"]["retryable"] is False
 
-    def test_gemini_unavailable_returns_502(self, client, ready_session):
-        """Test Gemini unavailable error returns 502."""
+    def test_gemini_unavailable_returns_503_when_models_exhausted(self, client, ready_session):
+        """Exhausted model availability returns 503 (docs/07-api-design.md §5).
+
+        A retryable network failure rotates across all eligible models; once
+        the attempt budget is exhausted the router reports service-unavailable.
+        """
         mock_gemini = MagicMock()
         mock_gemini.create_interaction.side_effect = GeminiError(
             category=GeminiErrorCategory.NETWORK_ERROR,
@@ -313,7 +318,7 @@ class TestQuestionEndpointGeminiErrors:
             json={"question": "What is this video about?"},
         )
 
-        assert response.status_code == 502
+        assert response.status_code == 503
         data = response.json()
         assert data["detail"]["error"]["code"] == "GEMINI_UNAVAILABLE"
         assert data["detail"]["error"]["retryable"] is True
